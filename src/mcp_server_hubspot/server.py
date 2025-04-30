@@ -8,6 +8,7 @@ import os
 from typing import Any, Dict, List, Optional
 import json
 from dotenv import load_dotenv
+import signal
 
 from mcp.server.models import InitializationOptions
 from mcp.server.lowlevel import NotificationOptions
@@ -31,9 +32,31 @@ logger = logging.getLogger('mcp_hubspot_server')
 
 load_dotenv()
 
+# Global shutdown event
+shutdown_event = asyncio.Event()
+
+def handle_signal(sig, frame):
+    logger.warning(f"Received signal {sig}, initiating shutdown...")
+    # Use call_soon_threadsafe if signal handlers run in a different thread
+    # from the event loop (often the case)
+    asyncio.get_running_loop().call_soon_threadsafe(shutdown_event.set)
+
 async def main(access_token: Optional[str] = None):
     """Run the HubSpot MCP server."""
     logger.info("Server starting")
+    
+    # Get the current event loop
+    loop = asyncio.get_running_loop()
+    
+    # Register signal handlers
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, handle_signal, sig, None)
+            logger.info(f"Registered signal handler for {sig.name}")
+        except NotImplementedError:
+            # Windows might not support add_signal_handler
+            logger.warning(f"Could not register signal handler for {sig.name} (possibly on Windows)")
+            signal.signal(sig, handle_signal) # Fallback for Windows?
     
     # Initialize dependencies
     embedding_model = initialize_embedding_model()
@@ -56,6 +79,8 @@ async def main(access_token: Optional[str] = None):
         search_handler
     )
     
+    server_task = None # Initialize task variable
+    
     # Based on MCP implementation, use stdio_server as a context manager that yields streams
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
         # Log server start
@@ -72,7 +97,62 @@ async def main(access_token: Optional[str] = None):
         )
         
         # Run the server with the provided streams and options
-        await server.run(read_stream, write_stream, initialization_options)
+        try:
+            logger.info("Attempting to run server.run() as a task...")
+            # Run server.run() in a separate task
+            server_task = asyncio.create_task(
+                server.run(read_stream, write_stream, initialization_options),
+                name="MCPServerRunLoop"
+            )
+            
+            # Wait for either the server task to finish or shutdown signal
+            done, pending = await asyncio.wait(
+                [server_task, shutdown_event.wait()],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            if shutdown_event.is_set():
+                logger.info("Shutdown event received, proceeding with cleanup.")
+            else:
+                # server_task must have finished (or errored)
+                logger.info("server_task completed or errored before shutdown signal.")
+                # Check for exceptions in the server task if it's in 'done'
+                if server_task in done:
+                    try:
+                        server_task.result() # Raise exception if one occurred
+                    except Exception as task_exc:
+                        logger.error(f"Exception in server_task: {task_exc}", exc_info=True)
+
+        except Exception as e:
+            logger.error(f"Error during server startup or waiting: {e}", exc_info=True)
+            shutdown_event.set() # Ensure shutdown on unexpected errors
+        finally:
+            logger.info("Entering finally block. Performing cleanup...")
+            
+            # Cancel the server task if it's still pending
+            if server_task and not server_task.done():
+                logger.info("Cancelling server_task...")
+                server_task.cancel()
+                try:
+                    await server_task # Allow cancellation to propagate
+                except asyncio.CancelledError:
+                    logger.info("server_task successfully cancelled.")
+                except Exception as cancel_exc:
+                    logger.error(f"Error awaiting cancelled server_task: {cancel_exc}", exc_info=True)
+            elif server_task and server_task.done() and not shutdown_event.is_set():
+                 logger.info("server_task finished on its own before shutdown signal.")
+
+            # Add any essential final cleanup here.
+            try:
+                logger.info("Performing final FAISS save (if needed)...")
+                # Example: Force save if needed
+                # await faiss_manager.save_all_indices() 
+                logger.info("Potential cleanup actions completed in finally block.")
+            except Exception as cleanup_e:
+                 logger.error(f"Error during final cleanup: {cleanup_e}", exc_info=True)
+            logger.info("Exiting async with stdio_server() context.")
+
+    logger.info("Exiting main function after stdio context.")
 
 def initialize_embedding_model() -> SentenceTransformer:
     """Initialize and return the embedding model."""
